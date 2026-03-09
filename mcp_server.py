@@ -19,6 +19,8 @@ import sqlite3
 import os
 import re
 import hashlib
+import json
+import time
 from datetime import datetime
 
 from fastmcp import FastMCP
@@ -27,12 +29,101 @@ from fastmcp import FastMCP
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DECRYPTED_DIR = os.path.join(SCRIPT_DIR, "decrypted")
+KEYS_FILE = os.path.join(SCRIPT_DIR, "wechat_keys.json")
+SYNC_COOLDOWN = 60  # seconds between auto-syncs
+
+_last_sync_time = 0
 
 MSG_TYPE_MAP = {
     1: "文本", 3: "图片", 34: "语音", 42: "名片",
     43: "视频", 47: "表情", 48: "位置", 49: "链接/文件",
     50: "通话", 10000: "系统", 10002: "撤回",
 }
+
+
+# ── Auto-sync ────────────────────────────────────────────────────────────────
+
+
+def _find_db_dir():
+    """Find WeChat's encrypted db_storage directory."""
+    import glob as _glob
+    base = os.path.expanduser(
+        "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
+    )
+    candidates = _glob.glob(os.path.join(base, "*", "db_storage"))
+    return candidates[0] if candidates else None
+
+
+def _find_sqlcipher():
+    brew_path = "/opt/homebrew/opt/sqlcipher/bin/sqlcipher"
+    if os.path.isfile(brew_path):
+        return brew_path
+    for p in os.environ.get("PATH", "").split(":"):
+        c = os.path.join(p, "sqlcipher")
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _decrypt_one(sqlcipher_bin, src, dst, key_hex):
+    """Decrypt a single SQLCipher database."""
+    import subprocess
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.exists(dst):
+        os.remove(dst)
+    sql = f"""PRAGMA key = "x'{key_hex}'";
+PRAGMA cipher_page_size = 4096;
+ATTACH DATABASE '{dst}' AS plaintext KEY '';
+SELECT sqlcipher_export('plaintext');
+DETACH DATABASE plaintext;
+"""
+    try:
+        r = subprocess.run(
+            [sqlcipher_bin, src], input=sql,
+            capture_output=True, text=True, timeout=120,
+        )
+        return r.returncode == 0 and os.path.isfile(dst) and os.path.getsize(dst) > 0
+    except Exception:
+        return False
+
+
+def _auto_sync(force=False):
+    """Re-decrypt only databases whose source file has changed. Clears contact cache if any DB was updated."""
+    global _last_sync_time, _contacts, _contacts_full
+
+    now = time.time()
+    if not force and (now - _last_sync_time) < SYNC_COOLDOWN:
+        return
+
+    if not os.path.isfile(KEYS_FILE):
+        return
+
+    sqlcipher_bin = _find_sqlcipher()
+    db_dir = _find_db_dir()
+    if not sqlcipher_bin or not db_dir:
+        return
+
+    with open(KEYS_FILE) as f:
+        keys = json.load(f)
+
+    updated = False
+    for db_rel, key_hex in keys.items():
+        if db_rel.startswith("__"):
+            continue
+        src = os.path.join(db_dir, db_rel)
+        dst = os.path.join(DECRYPTED_DIR, db_rel)
+        if not os.path.isfile(src):
+            continue
+        # Skip if decrypted file is newer than source
+        if not force and os.path.isfile(dst) and os.path.getmtime(dst) >= os.path.getmtime(src):
+            continue
+        if _decrypt_one(sqlcipher_bin, src, dst, key_hex):
+            updated = True
+
+    if updated:
+        _contacts = None
+        _contacts_full = None
+    _last_sync_time = time.time()
 
 
 # ── Database helpers ─────────────────────────────────────────────────────────
@@ -152,6 +243,24 @@ def _find_msg_table(username):
     return None, None
 
 
+def _find_all_msg_tables(username):
+    """Find ALL DBs that contain messages for this username. Returns list of (db_path, table_name)."""
+    table = _username_to_table(username)
+    results = []
+    for db_path in _get_msg_dbs():
+        conn = sqlite3.connect(db_path)
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if exists:
+                results.append((db_path, table))
+        finally:
+            conn.close()
+    return results
+
+
 def _parse_message(content, local_type, is_group, names):
     """Parse message content, return formatted string."""
     if content is None:
@@ -182,7 +291,16 @@ def _parse_message(content, local_type, is_group, names):
 
 # ── MCP Server ───────────────────────────────────────────────────────────────
 
-mcp = FastMCP("wechat", instructions="查询微信消息、联系人等数据。需要先运行 decrypt_db.py 解密数据库。")
+mcp = FastMCP("wechat", instructions="查询微信消息、联系人等数据。数据库会自动同步最新聊天记录（每60秒）。")
+
+
+@mcp.tool()
+def sync() -> str:
+    """手动同步微信数据库，获取最新聊天记录。
+    通常不需要手动调用，查询时会自动同步（每60秒）。
+    """
+    _auto_sync(force=True)
+    return "同步完成，数据库已更新为最新状态。"
 
 
 @mcp.tool()
@@ -193,6 +311,7 @@ def get_recent_sessions(limit: int = 20) -> str:
     Args:
         limit: 返回的会话数量，默认20
     """
+    _auto_sync()
     db = _get_session_db()
     if not os.path.isfile(db):
         return "错误: session.db 未找到，请先运行 python3 decrypt_db.py"
@@ -238,13 +357,16 @@ def get_recent_sessions(limit: int = 20) -> str:
 
 
 @mcp.tool()
-def get_chat_history(chat_name: str, limit: int = 50) -> str:
-    """获取指定聊天的消息记录。支持模糊匹配联系人名/备注名。
+def get_chat_history(chat_name: str, limit: int = 50, start_date: str = "", end_date: str = "") -> str:
+    """获取指定聊天的消息记录。支持模糊匹配联系人名/备注名，支持按日期范围筛选。
 
     Args:
         chat_name: 聊天对象的名字、备注名或wxid，自动模糊匹配
         limit: 返回的消息数量，默认50
+        start_date: 起始日期（含），格式 YYYY-MM-DD 或 YYYY-MM-DD HH:MM，留空不限
+        end_date: 结束日期（含），格式 YYYY-MM-DD 或 YYYY-MM-DD HH:MM，留空不限
     """
+    _auto_sync()
     username = _resolve_username(chat_name)
     if not username:
         return f"找不到聊天对象: {chat_name}\n提示: 用 get_contacts(query='{chat_name}') 搜索联系人"
@@ -253,23 +375,74 @@ def get_chat_history(chat_name: str, limit: int = 50) -> str:
     display_name = names.get(username, username)
     is_group = "@chatroom" in username
 
-    db_path, table_name = _find_msg_table(username)
-    if not db_path:
+    db_tables = _find_all_msg_tables(username)
+    if not db_tables:
         return f"找不到 {display_name} 的消息记录"
 
-    conn = sqlite3.connect(db_path)
-    try:
-        rows = conn.execute(f"""
-            SELECT local_type, create_time, message_content
-            FROM [{table_name}]
-            ORDER BY create_time DESC
-            LIMIT ?
-        """, (limit,)).fetchall()
-    finally:
-        conn.close()
+    # Build time filter
+    conditions = []
+    time_params = []
+    if start_date:
+        try:
+            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                try:
+                    ts = int(datetime.strptime(start_date, fmt).timestamp())
+                    break
+                except ValueError:
+                    continue
+            else:
+                return f"日期格式错误: {start_date}，请用 YYYY-MM-DD 或 YYYY-MM-DD HH:MM"
+            conditions.append("create_time >= ?")
+            time_params.append(ts)
+        except Exception:
+            return f"日期格式错误: {start_date}，请用 YYYY-MM-DD 或 YYYY-MM-DD HH:MM"
+    if end_date:
+        try:
+            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                try:
+                    dt = datetime.strptime(end_date, fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                return f"日期格式错误: {end_date}，请用 YYYY-MM-DD 或 YYYY-MM-DD HH:MM"
+            # If only date given, include the entire day
+            if len(end_date) <= 10:
+                dt = dt.replace(hour=23, minute=59, second=59)
+            ts = int(dt.timestamp())
+            conditions.append("create_time <= ?")
+            time_params.append(ts)
+        except Exception:
+            return f"日期格式错误: {end_date}，请用 YYYY-MM-DD 或 YYYY-MM-DD HH:MM"
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    # Query all matching databases and merge results
+    rows = []
+    for db_path, table_name in db_tables:
+        params = time_params + [limit]
+        conn = sqlite3.connect(db_path)
+        try:
+            db_rows = conn.execute(f"""
+                SELECT local_type, create_time, message_content
+                FROM [{table_name}]
+                {where}
+                ORDER BY create_time DESC
+                LIMIT ?
+            """, params).fetchall()
+            rows.extend(db_rows)
+        finally:
+            conn.close()
+
+    # Sort by time descending and take top N
+    rows.sort(key=lambda x: x[1], reverse=True)
+    rows = rows[:limit]
 
     if not rows:
-        return f"{display_name} 无消息记录"
+        msg = f"{display_name} 无消息记录"
+        if start_date or end_date:
+            msg += f"（{start_date or '...'} ~ {end_date or '...'}）"
+        return msg
 
     lines = []
     for local_type, create_time, content in reversed(rows):
@@ -277,7 +450,9 @@ def get_chat_history(chat_name: str, limit: int = 50) -> str:
         text = _parse_message(content, local_type, is_group, names)
         lines.append(f"[{time_str}] {text}")
 
-    header = f"{display_name} 的最近 {len(lines)} 条消息"
+    header = f"{display_name} 的 {len(lines)} 条消息"
+    if start_date or end_date:
+        header += f"（{start_date or '...'} ~ {end_date or '...'}）"
     if is_group:
         header += " [群聊]"
     return header + ":\n\n" + "\n".join(lines)
@@ -291,6 +466,7 @@ def search_messages(keyword: str, limit: int = 20) -> str:
         keyword: 搜索关键词
         limit: 返回的结果数量，默认20
     """
+    _auto_sync()
     if not keyword:
         return "请提供搜索关键词"
 
@@ -361,6 +537,7 @@ def get_contacts(query: str = "", limit: int = 50) -> str:
         query: 搜索关键词（匹配昵称、备注名、wxid），留空列出所有
         limit: 返回数量，默认50
     """
+    _auto_sync()
     _load_contacts()
     contacts = _contacts_full or []
 
